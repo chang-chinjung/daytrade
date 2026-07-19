@@ -1,41 +1,50 @@
 """
-fetch_fugle_raw_v3_fixed.py - 修復版
-1. 正確 endpoint: /marketdata/v1.0/stock/intraday/candles/{symbol}
-2. 空資料時不報 KeyError: date
-3. 支援 resume + 假日跳過
-pip install requests pandas pyarrow
-$env:FUGLE_API_KEY="你的MarketData key (UUID) 或 base64包"
-python fetch_fugle_raw_v3_fixed.py --input ./data/intraday_candidates.csv --start 2024-06-01 --end 2024-06-10 --out ./data/tw_1min_real.parquet --sleep 1.1
+fetch_fugle_raw_v3_fixed.py - 直連版，不做 base64 decode
+直接讀你自己的 FUGLE_API_KEY 明文
+支援 .env 自動讀取
+
+pip install requests pandas pyarrow python-dotenv
+python fetch_fugle_raw_v3_fixed.py --input ./data/intraday_candidates.csv --start 2024-06-03 --end 2024-06-07 --out ./data/tw_1min_real.parquet --sleep 1.1
 """
-import os, base64, time, argparse, requests
+import os, time, argparse, requests
 from pathlib import Path
 import pandas as pd
-from datetime import datetime, timedelta
 
-RAW = os.getenv("FUGLE_API_KEY","").strip()
+# --- 自動讀 .env ---
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
+        print(f"[ENV] 已載入 {env_path}")
+    else:
+        # 也試專案根目錄
+        load_dotenv()
+except ImportError:
+    print("[ENV] python-dotenv 沒安裝，改用系統環境變數 (pip install python-dotenv)")
 
-def decode_key(raw):
+def get_api_key():
+    # 支援你圖中的兩個名字
+    raw = (os.getenv("FUGLE_API_KEY") or 
+           os.getenv("FUGLE_MARKETDATA_API_KEY") or 
+           os.getenv("FUGLE_MARKETDATA_APIKEY") or "").strip()
+    raw = raw.strip().strip('"').strip("'")
     if not raw:
+        print("[FAIL] 找不到 FUGLE_API_KEY，請在 .env 填上")
+        print("  FUGLE_API_KEY=你的MarketData UUID")
         return ""
-    # 你的格式是 base64 裡面包兩個 UUID 用空格隔開
-    try:
-        dec = base64.b64decode(raw).decode().strip()
-        parts = dec.split()
-        print(f"[Key] base64 解開 -> 取第1段 MarketData key len={len(parts[0])}")
-        return parts[0]
-    except Exception:
-        # 已經是 UUID
-        first = raw.split()[0]
-        print(f"[Key] 直接使用 len={len(first)} -> {first[:8]}...")
-        return first
+    # 不做任何 base64 解碼，直接用明文
+    # 只取第一段，避免不小心貼到空白
+    key = raw.split()[0]
+    print(f"[Key] 直接使用明文 len={len(key)} -> {key[:8]}...{key[-4:]}")
+    return key
 
-API_KEY = decode_key(RAW)
-if not API_KEY:
-    print("請先 $env:FUGLE_API_KEY='你的key'")
-    # 不直接 exit，讓用戶看到說明
+API_KEY = get_api_key()
 
 def fetch_day(symbol, date_str):
-    # 正確 endpoint 2024 版
+    global API_KEY
+    if not API_KEY:
+        return None
     url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/candles/{symbol}"
     headers = {"X-API-KEY": API_KEY}
     params = {"from": date_str, "to": date_str}
@@ -45,11 +54,11 @@ def fetch_day(symbol, date_str):
         print(f"  {symbol} {date_str} 連線失敗 {e}")
         return None
     if r.status_code == 404:
-        # 沒這個商品或當天沒資料，靜默跳過
         return None
     if r.status_code == 401:
-        print(f"  {symbol} {date_str} 401 Unauthorized，檢查是否為 MarketData key")
-        print(r.text[:200])
+        print(f"  {symbol} {date_str} 401 Unauthorized")
+        print(f"  回應: {r.text[:500]}")
+        print(f"  檢查: 1) 這是不是 Trading API key? 要用 MarketData key  2) .env 是否貼錯?")
         return None
     if r.status_code == 429:
         print(f"  429限流，睡5秒")
@@ -85,7 +94,6 @@ def fetch_day(symbol, date_str):
     df['stock_id'] = symbol
     if 'volume' not in df.columns and 'turnover' in df.columns:
         df['volume'] = df['turnover']
-    # 確保必要欄位
     for col in ["open","high","low","close","volume"]:
         if col not in df.columns:
             df[col]=0
@@ -97,12 +105,18 @@ def fetch_day(symbol, date_str):
     return df
 
 def main():
+    global API_KEY
+    if not API_KEY:
+        API_KEY = get_api_key()
+        if not API_KEY:
+            return
+
     ap = argparse.ArgumentParser()
     ap.add_argument('--input', default='./data/intraday_candidates.csv')
-    ap.add_argument('--start', default='2024-06-01')
-    ap.add_argument('--end', default='2024-06-10')
+    ap.add_argument('--start', default='2024-06-03')
+    ap.add_argument('--end', default='2024-06-07')
     ap.add_argument('--out', default='./data/tw_1min_real.parquet')
-    ap.add_argument('--sleep', type=float, default=1.1, help="60/min限流，設1.1安全")
+    ap.add_argument('--sleep', type=float, default=1.1)
     args = ap.parse_args()
 
     in_path = Path(args.input)
@@ -110,7 +124,6 @@ def main():
         print(f"[FAIL] 找不到 {in_path}")
         return
     cand = pd.read_csv(in_path)
-    # 相容欄位名
     col = 'stock_id' if 'stock_id' in cand.columns else cand.columns[0]
     stocks = cand[col].astype(str).str.replace(".TW","").tolist()
     print(f"候選 {len(stocks)} 檔: {stocks[:10]}...")
@@ -123,7 +136,6 @@ def main():
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # resume
     existed = []
     done_set = set()
     if out_path.exists():
@@ -146,7 +158,6 @@ def main():
             key = f"{symbol}_{d.date()}"
             if key in done_set:
                 continue
-            # 跳過週末
             if d.weekday() >= 5:
                 continue
             df = fetch_day(symbol, ds)
@@ -157,19 +168,15 @@ def main():
 
     if not all_df:
         print("[FAIL] 全部沒抓到，可能是 key 錯誤、都是假日、或都是冷門股無1分K")
-        # 產生空檔避免後面 KeyError
         pd.DataFrame(columns=["datetime","open","high","low","close","volume","stock_id"]).to_parquet(out_path, index=False)
         return
 
     big = pd.concat(all_df, ignore_index=True)
-    # 防呆：避免空的
     if big.empty or 'datetime' not in big.columns:
         print("[FAIL] 合併後仍空")
         return
 
-    # 去重 + 排序
     big = big.sort_values(["stock_id","datetime"]).drop_duplicates(["stock_id","datetime"])
-    # 為了相容你之前用 date 欄位的程式，補 date 欄位
     big['date'] = pd.to_datetime(big['datetime']).dt.date
     big.to_parquet(out_path, index=False)
     print(f"\n[PASS] 已產生 {out_path} shape={big.shape}")
