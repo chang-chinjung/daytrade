@@ -1,0 +1,13 @@
+﻿__pycache__/
+*.pyc
+venv/
+.env
+*.log
+data/*.parquet
+data/*.csv
+!data/intraday_candidates.csv
+data/stock_meta/
+reports/
+*.zip
+config/
+fugle.json
